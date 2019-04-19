@@ -1,24 +1,102 @@
 #include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <WebSocketsServer.h>
-//#include <Adafruit_BMP085.h>
-#include <Ticker.h>
-#include "credentials.h"
 #include <ESP8266mDNS.h>
+#include <ArduinoOTA.h>
+#include <FS.h>
+#include <Hash.h>
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <SPIFFSEditor.h>
 #include <FS.h>
 #define ONE_HOUR 3600000UL
 #include <WiFiUdp.h>
-#define NODEBUG_WEBSOCKETS
+#include <Ticker.h>
 ADC_MODE(ADC_VCC);
 Ticker timer;
 
+// SKETCH BEGIN
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+AsyncEventSource events("/events");
 
-// Running a web server
-ESP8266WebServer server;
-File fsUploadFile; 
+void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len){
+  if(type == WS_EVT_CONNECT){
+    Serial.printf("ws[%s][%u] connect\n", server->url(), client->id());
+//    client->printf("Hello Client %u :)", client->id());
+    client->ping();
+  } else if(type == WS_EVT_DISCONNECT){
+    Serial.printf("ws[%s][%u] disconnect: %u\n", server->url(), client->id());
+  } else if(type == WS_EVT_ERROR){
+    Serial.printf("ws[%s][%u] error(%u): %s\n", server->url(), client->id(), *((uint16_t*)arg), (char*)data);
+  } else if(type == WS_EVT_PONG){
+    Serial.printf("ws[%s][%u] pong[%u]: %s\n", server->url(), client->id(), len, (len)?(char*)data:"");
+  } else if(type == WS_EVT_DATA){
+    AwsFrameInfo * info = (AwsFrameInfo*)arg;
+    String msg = "";
+    if(info->final && info->index == 0 && info->len == len){
+      //the whole message is in a single frame and we got all of it's data
+      Serial.printf("ws[%s][%u] %s-message[%llu]: ", server->url(), client->id(), (info->opcode == WS_TEXT)?"text":"binary", info->len);
+      Serial.println("We are in line 38");String floatrcd="";
+      if(info->opcode == WS_TEXT){
+      for(size_t i=0; i < info->len; i++) {
+          floatrcd += (char) data[i];
+          msg += (char) data[i];
+        }
+      Serial.println("Line 44");char buf[floatrcd.length()]; floatrcd.toCharArray(buf,floatrcd.length());float dataRate = 10.0*(float) atof(buf);timer.detach();timer.attach_ms(dataRate, getData);Serial.print("Data rate:");Serial.println(dataRate);Serial.print("Data Received:");Serial.println(floatrcd);
+ 
+      } else {
+        char buff[3];
+        for(size_t i=0; i < info->len; i++) {
+          Serial.println("Line 46");
+          sprintf(buff, "%02x ", (uint8_t) data[i]);
+          msg += buff ;
+        }
+      }
+      Serial.printf("%s\n",msg.c_str());
 
-// Adding a websocket to the server
-WebSocketsServer webSocket = WebSocketsServer(81);
+      if(info->opcode == WS_TEXT)
+        client->text("I got your text message");
+      else
+        client->binary("I got your binary message");
+    } else {
+      //message is comprised of multiple frames or the frame is split into multiple packets
+      if(info->index == 0){
+        if(info->num == 0)
+          Serial.printf("ws[%s][%u] %s-message start\n", server->url(), client->id(), (info->message_opcode == WS_TEXT)?"text":"binary");
+        Serial.printf("ws[%s][%u] frame[%u] start[%llu]\n", server->url(), client->id(), info->num, info->len);
+      }
+
+      Serial.printf("ws[%s][%u] frame[%u] %s[%llu - %llu]: ", server->url(), client->id(), info->num, (info->message_opcode == WS_TEXT)?"text":"binary", info->index, info->index + len);
+
+      if(info->opcode == WS_TEXT){
+        for(size_t i=0; i < info->len; i++) {
+          msg += (char) data[i];Serial.print("LIne 69:msg=");Serial.println(msg);
+          float dataRate = (float) atof((const char *) &data);
+          timer.detach();
+          timer.attach(dataRate, getData);
+ 
+        }
+      } else {
+        char buff[3];
+        for(size_t i=0; i < info->len; i++) {
+          sprintf(buff, "%02x ", (uint8_t) data[i]);
+          msg += buff ;
+        }
+      }
+      Serial.printf("%s\n",msg.c_str());
+
+      if((info->index + len) == info->len){
+        Serial.printf("ws[%s][%u] frame[%u] end[%llu]\n", server->url(), client->id(), info->num, info->len);
+        if(info->final){
+          Serial.printf("ws[%s][%u] %s-message end\n", server->url(), client->id(), (info->message_opcode == WS_TEXT)?"text":"binary");
+          if(info->message_opcode == WS_TEXT)
+            client->text("I got your text message");
+          else
+            client->binary("I got your binary message");
+        }
+      }
+    }
+  }
+}
 
 // Serving a web page (from flash memory)
 // formatted as a string literal!
@@ -31,7 +109,7 @@ char webpage[] PROGMEM = R"=====(
 <body onload="javascript:init()">
 <!-- Adding a slider for controlling data rate -->
 <div>
-  <input type="range" min="0.1" max="10" value="5" id="dataRateSlider" oninput="sendDataRate()" />
+  <input type="range" min="1" max="1000" value="50" id="dataRateSlider" oninput="sendDataRate()" />
   <label for="dataRateSlider" id="dataRateLabel">Rate: 0.2Hz</label>
 </div>
 <hr />
@@ -54,7 +132,7 @@ char webpage[] PROGMEM = R"=====(
   }
   var incomingdata;
   function init() {
-    webSocket = new WebSocket('ws://' + window.location.hostname + ':81/');
+    webSocket = new WebSocket('ws://' + window.location.hostname + ':80/ws');
     dataPlot = new Chart(document.getElementById("line-chart"), {
       type: 'line',
       data: {
@@ -81,7 +159,7 @@ char webpage[] PROGMEM = R"=====(
     var dataRate = document.getElementById("dataRateSlider").value;
     webSocket.send(dataRate);
     //dataRate = dataRate;
-    dataRate = 1.0/dataRate;
+    dataRate = 1000/dataRate;
  //   document.getElementById("dataRateLabel").innerHTML = "Rate: " + dataRate + "Hz";
     document.getElementById("dataRateLabel").innerHTML = "Rate: " + dataRate.toFixed(2) + "Hz";
 
@@ -108,28 +186,130 @@ bool tmpRequested = false;
 const unsigned long DS_delay = 750;         // Reading the temperature from the DS18x20 can take up to 750ms
 
 uint32_t timeUNIX = 0;  
-void setup() {
-  // put your setup code here, to run once:
-  WiFi.begin(ssid, password);
-  Serial.begin(115200);
-  Serial.setDebugOutput(false);
-  while(WiFi.status()!=WL_CONNECTED) {
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println("");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
 
-  server.on("/",[](){
-    server.send_P(200, "text/html", webpage);
+#include "credentials.h"
+const char * hostName = "esp-async";
+const char* http_username = "admin";
+const char* http_password = "admin";
+
+void setup(){
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  WiFi.hostname(hostName);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(hostName);
+  WiFi.begin(ssid, password);
+  if (WiFi.waitForConnectResult() != WL_CONNECTED) {
+    Serial.printf("STA: Failed!\n");
+    WiFi.disconnect(false);
+    delay(1000);
+    WiFi.begin(ssid, password);
+  }
+
+  //Send OTA events to the browser
+  ArduinoOTA.onStart([]() { events.send("Update Start", "ota"); });
+  ArduinoOTA.onEnd([]() { events.send("Update End", "ota"); });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    char p[32];
+    sprintf(p, "Progress: %u%%\n", (progress/(total/100)));
+    events.send(p, "ota");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    if(error == OTA_AUTH_ERROR) events.send("Auth Failed", "ota");
+    else if(error == OTA_BEGIN_ERROR) events.send("Begin Failed", "ota");
+    else if(error == OTA_CONNECT_ERROR) events.send("Connect Failed", "ota");
+    else if(error == OTA_RECEIVE_ERROR) events.send("Recieve Failed", "ota");
+    else if(error == OTA_END_ERROR) events.send("End Failed", "ota");
+  });
+  ArduinoOTA.setHostname(hostName);
+  ArduinoOTA.begin();
+
+  MDNS.addService("http","tcp",80);
+
+  SPIFFS.begin();
+
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  events.onConnect([](AsyncEventSourceClient *client){
+    client->send("hello!",NULL,millis(),1000);
+  });
+  server.addHandler(&events);
+
+  server.addHandler(new SPIFFSEditor(http_username,http_password));
+
+  server.on("/heap", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", String(ESP.getFreeHeap()));
+  });
+ server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/html", webpage);
+  });
+ // server.serveStatic("/", SPIFFS, "/").setDefaultFile("index.htm");
+
+  server.onNotFound([](AsyncWebServerRequest *request){
+    Serial.printf("NOT_FOUND: ");
+    if(request->method() == HTTP_GET)
+      Serial.printf("GET");
+    else if(request->method() == HTTP_POST)
+      Serial.printf("POST");
+    else if(request->method() == HTTP_DELETE)
+      Serial.printf("DELETE");
+    else if(request->method() == HTTP_PUT)
+      Serial.printf("PUT");
+    else if(request->method() == HTTP_PATCH)
+      Serial.printf("PATCH");
+    else if(request->method() == HTTP_HEAD)
+      Serial.printf("HEAD");
+    else if(request->method() == HTTP_OPTIONS)
+      Serial.printf("OPTIONS");
+    else
+      Serial.printf("UNKNOWN");
+    Serial.printf(" http://%s%s\n", request->host().c_str(), request->url().c_str());
+
+    if(request->contentLength()){
+      Serial.printf("_CONTENT_TYPE: %s\n", request->contentType().c_str());
+      Serial.printf("_CONTENT_LENGTH: %u\n", request->contentLength());
+    }
+
+    int headers = request->headers();
+    int i;
+    for(i=0;i<headers;i++){
+      AsyncWebHeader* h = request->getHeader(i);
+      Serial.printf("_HEADER[%s]: %s\n", h->name().c_str(), h->value().c_str());
+    }
+
+    int params = request->params();
+    for(i=0;i<params;i++){
+      AsyncWebParameter* p = request->getParam(i);
+      if(p->isFile()){
+        Serial.printf("_FILE[%s]: %s, size: %u\n", p->name().c_str(), p->value().c_str(), p->size());
+      } else if(p->isPost()){
+        Serial.printf("_POST[%s]: %s\n", p->name().c_str(), p->value().c_str());
+      } else {
+        Serial.printf("_GET[%s]: %s\n", p->name().c_str(), p->value().c_str());
+      }
+    }
+
+    request->send(404);
+  });
+  server.onFileUpload([](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){
+    if(!index)
+      Serial.printf("UploadStart: %s\n", filename.c_str());
+    Serial.printf("%s", (const char*)data);
+    if(final)
+      Serial.printf("UploadEnd: %s (%u)\n", filename.c_str(), index+len);
+  });
+  server.onRequestBody([](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+    if(!index)
+      Serial.printf("BodyStart: %u\n", total);
+    Serial.printf("%s", (const char*)data);
+    if(index + len == total)
+      Serial.printf("BodyEnd: %u\n", total);
   });
   server.begin();
-  webSocket.begin();
-  webSocket.onEvent(webSocketEvent);
-  
-//  bmp.begin();
-  timer.attach(5, getData);
+
+
+   timer.attach(5, getData);
   startUDP();  
     WiFi.hostByName(ntpServerName, timeServerIP); // Get the IP address of the NTP server
   Serial.print("Time server IP:\t");
@@ -137,11 +317,12 @@ void setup() {
 
   sendNTPpacket(timeServerIP);
   delay(500);
+
 }
 
-void loop() {
-
-
+void loop(){
+  ArduinoOTA.handle();
+  
    unsigned long currentMillis = millis();
 
   if (currentMillis - prevNTP > intervalNTP) { // Request the time from the time server every hour
@@ -190,8 +371,7 @@ void loop() {
   }
   yield();
   // put your main code here, to run repeatedly:
-  webSocket.loop();
-  server.handleClient();
+
 
 
   
@@ -247,17 +427,11 @@ void getData() {
 //  Serial.println("Json string is:"+json);
 //  Serial.println("Converted Cstyle string is:");Serial.println(json.c_str());
 //  Serial.println("Length:");json.length();
-  webSocket.broadcastTXT(json.c_str(), json.length());
+    ws.textAll((char*)json.c_str());
+//  webSocket.broadcastTXT(json.c_str(), json.length());
 }
 
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length){
-  // Do something with the data from the client
-  if(type == WStype_TEXT){
-    float dataRate = (float) atof((const char *) &payload[0]);
-    timer.detach();
-    timer.attach(dataRate, getData);
-  }
-}
+
 void sendNTPpacket(IPAddress& address) {
   Serial.println("Sending NTP request");
   memset(packetBuffer, 0, NTP_PACKET_SIZE);  // set all bytes in the buffer to 0
@@ -282,52 +456,6 @@ unsigned long getTime() { // Check if the time server has responded, if so, get 
   // subtract seventy years:
   uint32_t UNIXTime = NTPTime - seventyYears;
   return UNIXTime;
-}
-bool handleFileRead(String path) { // send the right file to the client (if it exists)
-  Serial.println("handleFileRead: " + path);
-  if (path.endsWith("/")) path += "index.html";          // If a folder is requested, send the index file
-  String contentType = getContentType(path);             // Get the MIME type
-  String pathWithGz = path + ".gz";
-  if (SPIFFS.exists(pathWithGz) || SPIFFS.exists(path)) { // If the file exists, either as a compressed archive, or normal
-    if (SPIFFS.exists(pathWithGz))                         // If there's a compressed version available
-      path += ".gz";                                         // Use the compressed verion
-    File file = SPIFFS.open(path, "r");                    // Open the file
-    size_t sent = server.streamFile(file, contentType);    // Send it to the client
-    file.close();                                          // Close the file again
-    Serial.println(String("\tSent file: ") + path);
-    return true;
-  }
-  Serial.println(String("\tFile Not Found: ") + path);   // If the file doesn't exist, return false
-  return false;
-}
-
-void handleFileUpload() { // upload a new file to the SPIFFS
-  HTTPUpload& upload = server.upload();
-  String path;
-  if (upload.status == UPLOAD_FILE_START) {
-    path = upload.filename;
-    if (!path.startsWith("/")) path = "/" + path;
-    if (!path.endsWith(".gz")) {                         // The file server always prefers a compressed version of a file
-      String pathWithGz = path + ".gz";                  // So if an uploaded file is not compressed, the existing compressed
-      if (SPIFFS.exists(pathWithGz))                     // version of that file must be deleted (if it exists)
-        SPIFFS.remove(pathWithGz);
-    }
-    Serial.print("handleFileUpload Name: "); Serial.println(path);
-    fsUploadFile = SPIFFS.open(path, "w");               // Open the file for writing in SPIFFS (create if it doesn't exist)
-    path = String();
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (fsUploadFile)
-      fsUploadFile.write(upload.buf, upload.currentSize); // Write the received bytes to the file
-  } else if (upload.status == UPLOAD_FILE_END) {
-    if (fsUploadFile) {                                   // If the file was successfully created
-      fsUploadFile.close();                               // Close the file again
-      Serial.print("handleFileUpload Size: "); Serial.println(upload.totalSize);
-      server.sendHeader("Location", "/success.html");     // Redirect the client to the success page
-      server.send(303);
-    } else {
-      server.send(500, "text/plain", "500: couldn't create file");
-    }
-  }
 }
 
 /*__________________________________________________________HELPER_FUNCTIONS__________________________________________________________*/
